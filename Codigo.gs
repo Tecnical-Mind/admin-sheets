@@ -146,6 +146,12 @@ function vincularPlanilla() {
   Logger.log('Planilla vinculada. Ya podés ejecutar crearEstructura desde el editor.');
 }
 
+/** Muestra un aviso en la planilla; si se ejecuta desde el editor, lo escribe en el registro. */
+function toast_(msg, titulo, seg) {
+  try { libro_(); if (VINCULADO_) { libro_().toast(msg, titulo, seg); return; } } catch (e) {}
+  Logger.log('[' + (titulo || 'Aviso') + '] ' + msg);
+}
+
 /** Devuelve la interfaz de la planilla; si se ejecuta desde el editor o un activador, usa un reemplazo que escribe en el registro. */
 function ui_() {
   try { libro_(); if (!VINCULADO_) throw new Error('sin ui'); return SpreadsheetApp.getUi(); } catch (e) {
@@ -673,7 +679,7 @@ function sincronizarCaja(silencioso) {
     if (sh.getLastRow() >= 2) total += procesarFilas_(sh, 2, sh.getLastRow());
   });
   if (silencioso !== true) {
-    ss.toast(total ? 'Se agregaron ' + total + ' movimientos a Caja.' : 'Caja ya estaba al día.', 'Caja', 5);
+    toast_(total ? 'Se agregaron ' + total + ' movimientos a Caja.' : 'Caja ya estaba al día.', 'Caja', 5);
   }
   return total;
 }
@@ -990,7 +996,7 @@ function actualizarTablero(silencioso) {
   sh.setHiddenGridlines(true);
   if (silencioso !== true && VINCULADO_) {
     ss.setActiveSheet(sh);
-    ss.toast('Tablero actualizado.', 'Administración', 4);
+    toast_('Tablero actualizado.', 'Administración', 4);
   }
 }
 
@@ -1406,7 +1412,7 @@ function cargarEjemplos(sinConfirmar) {
     procesarFilas_(hoja_(e[0]), f, f);
   });
   actualizarTablero(true);
-  libro_().toast('Se cargaron filas de EJEMPLO.', 'Ejemplos', 5);
+  toast_('Se cargaron filas de EJEMPLO.', 'Ejemplos', 5);
 }
 
 function borrarEjemplos() {
@@ -1424,7 +1430,7 @@ function borrarEjemplos() {
     }
   });
   actualizarTablero(true);
-  ss.toast('Se borraron ' + n + ' filas de EJEMPLO.', 'Ejemplos', 5);
+  toast_('Se borraron ' + n + ' filas de EJEMPLO.', 'Ejemplos', 5);
 }
 
 // ----------------------------------------------------------------------------
