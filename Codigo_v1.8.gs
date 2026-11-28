@@ -11,6 +11,7 @@
  *   - Caja se carga sola con cada pago, cobro y gasto (sin duplicados).
  *   - Estado "Vencida" automático.
  *   - Recordatorio diario por email.
+ *   - Pagos de Mercado Pago cargados solos desde Gmail (cada 15 minutos).
  *
  *  Pegar este archivo completo en Extensiones > Apps Script (Código.gs).
  * ============================================================================
@@ -196,6 +197,16 @@ function onOpen() {
     .addSeparator()
     .addItem('Activar recordatorio diario por email', 'activarRecordatorio')
     .addItem('Desactivar recordatorios', 'desactivarRecordatorios')
+    .addSeparator()
+    .addItem('Importar pagos de Mercado Pago ahora', 'importarMercadoPago')
+    .addItem('Activar importación automática de Mercado Pago', 'activarImportacionMercadoPago')
+    .addItem('Desactivar importación de Mercado Pago', 'desactivarImportacionMercadoPago')
+    .addSubMenu(ui.createMenu('Notificaciones del celular (MP)')
+      .addItem('Configurar / ver pasos y token', 'configurarNotificacionesMP')
+      .addItem('Probar (sin cargar nada)', 'probarNotificacionMP')
+      .addItem('Ver notificaciones sin leer', 'verNotificacionesNoLeidasMP')
+      .addItem('Limpiar notificaciones sin leer', 'limpiarNotificacionesNoLeidasMP')
+      .addItem('Regenerar token', 'regenerarTokenMP'))
     .addSeparator()
     .addSubMenu(ui.createMenu('Ejemplos')
       .addItem('Cargar filas de EJEMPLO', 'cargarEjemplos')
@@ -806,6 +817,7 @@ function revisarDatosIncompletos() {
 
   const nuevosCaja = sincronizarCaja(true);
   if (!leerFilas_(H.CAJA).length) add(H.CAJA, '', '', '', 'Caja está vacía: todavía no hay pagos, cobros ni gastos registrados', 'Media');
+  problemasNotifMP_().forEach(function (f) { problemas.push(f); });
   escribirProblemas_(problemas);
 
   const ui = ui_();
@@ -1102,6 +1114,667 @@ function enviarRecordatorioDiario() {
   const asunto = 'Administración: ' + R.vencidas.length + ' vencidos, ' + R.proximas.length + ' por vencer, ' +
     esperando.length + ' cobros esperando el pago';
   MailApp.sendEmail({ to: emailDestino_(), subject: asunto, htmlBody: html });
+}
+
+// ----------------------------------------------------------------------------
+//  IMPORTACIÓN AUTOMÁTICA DE PAGOS DE MERCADO PAGO (desde Gmail)
+//
+//  Lee los mails "Pago aprobado en …" que manda Mercado Pago y carga cada pago
+//  como una fila en Gastos (y por lo tanto en Caja). Los mails ya leídos quedan
+//  con la etiqueta ERP-procesado; los que no se pudieron leer, con ERP-revisar.
+//  OJO: GmailApp lee el Gmail de la cuenta dueña del script. Si los mails de
+//  Mercado Pago llegan a otra casilla, reenviálos con un filtro (ver INSTRUCCIONES.md).
+// ----------------------------------------------------------------------------
+
+/** Búsqueda de Gmail para encontrar los comprobantes (se puede ajustar). */
+const MP_BUSQUEDA = 'subject:"Pago aprobado" (from:mercadopago OR "Pago procesado por Mercado Pago") newer_than:7d';
+const MP_ETIQUETA_OK = 'ERP-procesado';
+const MP_ETIQUETA_REVISAR = 'ERP-revisar';
+const MP_NOTA = 'Importado de Mercado Pago';
+
+/**
+ * Cómo se llama en tu Config cada medio de pago que aparece en el mail.
+ * Se revisa en orden: la primera expresión que coincide con el texto del medio gana.
+ * Si ninguna coincide, se guarda el texto del mail tal cual (y revisarDatosIncompletos lo marca).
+ */
+const MP_MEDIOS = [
+  [/tarjeta mercado pago|mercado pago cr[eé]dito/i, 'Master Elio Mercado Pago'],
+  [/dinero (disponible|en cuenta)|saldo|mercado pago d[eé]bito/i, 'Elio Mercado Pago'],
+  [/galicia/i, 'Visa Elio Galicia'],
+  [/brubank/i, 'Brubank Elio'],
+  [/\bbna\b|banco naci[oó]n/i, 'BNA+ Elio'],
+  [/master ?card|\bmaster\b/i, 'Master Elio Mercado Pago']
+];
+
+/**
+ * Categoría según el comercio (o el texto del mail). La primera regla que coincide gana.
+ * Si la categoría no existe en Config (columna B), se agrega sola.
+ * Si ninguna coincide, la categoría queda vacía y aparece en la hoja Problemas.
+ */
+const MP_CATEGORIAS = [
+  [/\bgnc\b|ypf|shell|axion|puma energy|\bnafta|combustible|estaci[oó]n de servicio|servicentro|petrol/i, 'Combustible'],
+  [/edemsa|aysam|agua y saneamiento|ecogas|cuyana|\bitc\b/i, 'Casa']
+];
+
+const MP_MESES = { enero: 0, febrero: 1, marzo: 2, abril: 3, mayo: 4, junio: 5, julio: 6, agosto: 7,
+  septiembre: 8, setiembre: 8, octubre: 9, noviembre: 10, diciembre: 11 };
+
+/** La ejecuta el activador cada 15 minutos. También se puede correr a mano desde el editor o el menú. */
+function importarMercadoPago() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) { Logger.log('Otra importación está en curso; se saltea esta.'); return 0; }
+  try {
+    verificarEstructura_();
+    const sh = hoja_(H.GASTOS);
+    const tz = libro_().getSpreadsheetTimeZone();
+    const etOk = GmailApp.getUserLabelByName(MP_ETIQUETA_OK) || GmailApp.createLabel(MP_ETIQUETA_OK);
+    const etRev = GmailApp.getUserLabelByName(MP_ETIQUETA_REVISAR) || GmailApp.createLabel(MP_ETIQUETA_REVISAR);
+    const hilos = GmailApp.search(MP_BUSQUEDA + ' -label:' + MP_ETIQUETA_OK + ' -label:' + MP_ETIQUETA_REVISAR, 0, 50);
+    if (!hilos.length) { Logger.log('Mercado Pago: no hay comprobantes nuevos.'); return 0; }
+
+    let yaCargados = notasGastos_(); // texto de todas las notas, para no duplicar
+    const categorias = listaConfig_(2);
+    const filas = [];
+    const errores = [];
+
+    hilos.forEach(function (hilo) {
+      let fallo = false;
+      hilo.getMessages().forEach(function (msg) {
+        const idMsg = msg.getId();
+        if (yaCargados.indexOf(idMsg) !== -1) return;
+        let p;
+        try {
+          p = parsearMailMercadoPago_(msg.getSubject(), cuerpoMail_(msg), msg.getDate());
+        } catch (e) {
+          fallo = true;
+          errores.push('"' + msg.getSubject() + '" (' + Utilities.formatDate(msg.getDate(), tz, 'dd/MM/yyyy HH:mm') + '): ' + e.message);
+          return;
+        }
+        if (p.operacion && yaCargados.indexOf('Op ' + p.operacion) !== -1) return; // mismo pago reenviado
+        if (p.categoria && categorias.indexOf(p.categoria) === -1) { agregarCategoria_(p.categoria); categorias.push(p.categoria); }
+        filas.push({
+          'Fecha': p.fecha,
+          'Concepto': p.comercio,
+          'Categoría': p.categoria,
+          'Proveedor': p.comercio,
+          'Importe ARS': p.moneda === 'ARS' ? p.importe : '',
+          'Importe USD': p.moneda === 'USD' ? p.importe : '',
+          'Medio de pago': p.medio,
+          'Notas': MP_NOTA + ' · ' + p.medioTexto + (p.operacion ? ' · Op ' + p.operacion : '') + ' · Gmail ' + idMsg
+        });
+        yaCargados += ' ' + idMsg + (p.operacion ? ' Op ' + p.operacion : '');
+      });
+      hilo.addLabel(fallo ? etRev : etOk);
+    });
+
+    if (filas.length) {
+      const desde = sh.getLastRow() + 1;
+      filas.forEach(function (f) { agregarFila_(H.GASTOS, f); });
+      const m = mapa_(sh);
+      if (m['Fecha']) sh.getRange(desde, m['Fecha'], filas.length, 1).setNumberFormat(FMT.FECHA);
+      if (m['Importe ARS']) sh.getRange(desde, m['Importe ARS'], filas.length, 1).setNumberFormat(FMT.ARS);
+      if (m['Importe USD']) sh.getRange(desde, m['Importe USD'], filas.length, 1).setNumberFormat(FMT.USD);
+      procesarFilas_(sh, desde, sh.getLastRow()); // asigna ID y pasa los gastos a Caja
+      sincronizarCaja(true);
+      actualizarTablero(true);
+    }
+
+    const resumen = 'Mercado Pago: ' + filas.length + ' pago(s) cargado(s) en Gastos' +
+      (errores.length ? ', ' + errores.length + ' mail(s) sin poder leer (etiqueta ' + MP_ETIQUETA_REVISAR + ')' : '') + '.';
+    Logger.log(resumen);
+    errores.forEach(function (e) { Logger.log('  No se pudo leer ' + e); });
+    if (filas.length || errores.length) toast_(resumen, 'Mercado Pago', 8);
+    return filas.length;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Extrae los datos de un comprobante de Mercado Pago. No usa servicios de Google (se puede probar aparte).
+ * Devuelve { fecha, comercio, importe, moneda, medio, medioTexto, ultimos4, operacion, categoria }.
+ * Lanza un error si no encuentra el importe o el comercio.
+ */
+function parsearMailMercadoPago_(asunto, cuerpo, fechaMail) {
+  const txt = String(cuerpo || '').replace(/\r/g, '').replace(/\u00a0/g, ' ');
+  const lineas = txt.split('\n').map(function (l) { return l.replace(/\s+/g, ' ').trim(); }).filter(String);
+  const plano = lineas.join('\n');
+
+  // Importe: "Pagaste $ 146.970,50" o "Pagaste US$ 22,39"
+  const mi = plano.match(/Pagaste\s*(US\$|U\$S|\$)\s*([\d.]+(?:,\d{1,2})?)/i);
+  if (!mi) throw new Error('no encontré el importe ("Pagaste $ …")');
+  const moneda = /U/i.test(mi[1]) ? 'USD' : 'ARS';
+  const importe = num_(mi[2]);
+  if (!importe) throw new Error('importe inválido: ' + mi[2]);
+
+  // Comercio: "Le compraste a Edemsa" (el mail lo repite pegado) o el asunto "Pago aprobado en Edemsa"
+  let comercio = '';
+  const mc = plano.match(/Le (?:compraste|pagaste) a\s+(.+?)(?=Le (?:compraste|pagaste) a|\n|$)/i);
+  if (mc) comercio = mc[1].trim();
+  if (!comercio) {
+    const ma = String(asunto || '').match(/Pago aprobado (?:en|a)\s+(.+)$/i);
+    if (ma) comercio = ma[1].trim();
+  }
+  comercio = comercio.replace(/[\s.\-]+$/, '').trim();
+  if (!comercio) throw new Error('no encontré el comercio');
+
+  // Medio: la primera línea con texto después del importe
+  let medioTexto = '';
+  const iImp = lineas.findIndex(function (l) { return /Pagaste\s*(US\$|U\$S|\$)/i.test(l); });
+  for (let i = iImp + 1; i < lineas.length && i <= iImp + 4; i++) {
+    const l = lineas[i];
+    if (/cuota|Si necesit|Nombre en el resumen|operaci[oó]n|Pago procesado/i.test(l)) break;
+    medioTexto = l; break;
+  }
+  const m4 = medioTexto.match(/\*+\s*(\d{4})/);
+  const ultimos4 = m4 ? m4[1] : '';
+  medioTexto = medioTexto.replace(/\*+\s*\d{4}/, ultimos4 ? '****' + ultimos4 : '').trim();
+  let medio = medioTexto;
+  for (let i = 0; i < MP_MEDIOS.length; i++) {
+    if (MP_MEDIOS[i][0].test(medioTexto)) { medio = MP_MEDIOS[i][1]; break; }
+  }
+
+  // N° de operación: "N.° de operación 181380678755" o el link "activities?q=187981162529"
+  let operacion = '';
+  const mo = plano.match(/N\.?\s*[°º]?\s*de operaci[oó]n\s*\n?\s*(\d{6,})/i) || plano.match(/activities\?q=(\d{6,})/i);
+  if (mo) operacion = mo[1];
+
+  // Fecha: "Fecha y hora 4 de octubre a las 17:37 hs" (sin año) o la fecha del mail
+  const base = (fechaMail && typeof fechaMail.getTime === 'function' && !isNaN(fechaMail.getTime())) ? fechaMail : new Date();
+  let fecha = null;
+  const mf = plano.match(/(\d{1,2}) de ([a-záéíóú]+)(?: de (\d{4}))? a las \d{1,2}:\d{2}/i);
+  if (mf && MP_MESES[mf[2].toLowerCase()] !== undefined) {
+    const mes = MP_MESES[mf[2].toLowerCase()];
+    let anio = mf[3] ? +mf[3] : base.getFullYear();
+    if (!mf[3] && mes > base.getMonth()) anio--; // pago de diciembre informado en enero
+    fecha = new Date(anio, mes, +mf[1]);
+  }
+  if (!fecha) fecha = new Date(base.getFullYear(), base.getMonth(), base.getDate());
+
+  let categoria = '';
+  const claveCat = comercio + ' ' + String(asunto || '');
+  for (let i = 0; i < MP_CATEGORIAS.length; i++) {
+    if (MP_CATEGORIAS[i][0].test(claveCat)) { categoria = MP_CATEGORIAS[i][1]; break; }
+  }
+
+  return { fecha: fecha, comercio: comercio, importe: importe, moneda: moneda, medio: medio,
+    medioTexto: medioTexto, ultimos4: ultimos4, operacion: operacion, categoria: categoria };
+}
+
+/** Cuerpo del mail en texto: el texto plano y, si viene vacío, el HTML sin etiquetas. */
+function cuerpoMail_(msg) {
+  let t = '';
+  try { t = msg.getPlainBody(); } catch (e) {}
+  if (t && /Pagaste/i.test(t)) return t;
+  const html = msg.getBody() || '';
+  return html
+    .replace(/<(style|script)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<br\s*\/?>|<\/(p|div|tr|td|h\d|li|table)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&deg;/gi, '°').replace(/&middot;/gi, '·')
+    .replace(/&#(\d+);/g, function (_, n) { return String.fromCharCode(+n); });
+}
+
+/** Todas las notas de Gastos juntas en un texto (para detectar mails ya importados). */
+function notasGastos_() {
+  const sh = hoja_(H.GASTOS);
+  const m = mapa_(sh);
+  if (!m['Notas'] || sh.getLastRow() < 2) return '';
+  return sh.getRange(2, m['Notas'], sh.getLastRow() - 1, 1).getValues()
+    .map(function (r) { return String(r[0]); }).join(' ');
+}
+
+/** Agrega una categoría al final de la columna B de Config. */
+function agregarCategoria_(nombre) {
+  const sh = hoja_(H.CONFIG);
+  const vals = sh.getRange(2, 2, Math.max(sh.getLastRow() - 1, 1), 1).getValues();
+  let ultima = 1;
+  vals.forEach(function (r, i) { if (String(r[0]).trim()) ultima = i + 2; });
+  sh.getRange(ultima + 1, 2).setValue(nombre);
+  Logger.log('Se agregó la categoría "' + nombre + '" en Config.');
+}
+
+/** Crea el activador que importa los pagos de Mercado Pago cada 15 minutos (sin duplicarlo). */
+function activarImportacionMercadoPago() {
+  verificarEstructura_();
+  desactivarImportacionMercadoPago(true);
+  GmailApp.getUserLabelByName(MP_ETIQUETA_OK) || GmailApp.createLabel(MP_ETIQUETA_OK); // pide el permiso de Gmail ahora
+  ScriptApp.newTrigger('importarMercadoPago').timeBased().everyMinutes(15).create();
+  const n = importarMercadoPago();
+  const ui = ui_();
+  ui.alert('Importación de Mercado Pago activada',
+    'Cada 15 minutos se van a leer los mails "Pago aprobado" de Mercado Pago de ' + Session.getEffectiveUser().getEmail() +
+    ' y se van a cargar en Gastos y Caja.\n\nAhora mismo se cargaron ' + n + ' pago(s).', ui.ButtonSet.OK);
+}
+
+function desactivarImportacionMercadoPago(silencioso) {
+  let n = 0;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'importarMercadoPago') { ScriptApp.deleteTrigger(t); n++; }
+  });
+  if (silencioso !== true) {
+    const ui = ui_();
+    ui.alert('Mercado Pago', n ? 'Importación automática desactivada.' : 'La importación automática no estaba activa.', ui.ButtonSet.OK);
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  NOTIFICACIONES DE MERCADO PAGO EN EL CELULAR (Android + MacroDroid)
+//
+//  MacroDroid lee cada notificación de la app Mercado Pago ("Pagaste $ 15.000
+//  en YPF…") y la manda por HTTP a este script publicado como Aplicación web.
+//  doPost la valida con un token secreto, la interpreta y la carga en Gastos
+//  (y por lo tanto en Caja). Pasos completos en INSTRUCCIONES.md.
+// ----------------------------------------------------------------------------
+
+/** Medio de pago cuando la notificación no dice con qué pagaste (se puede pisar con la propiedad del script del mismo nombre). */
+const MP_MEDIO_NOTIF_DEFECTO = 'Master Elio Mercado Pago';
+const MP_NOTA_NOTIF = 'Importado de notificación MP';
+const MP_NOTIF_PAQUETE = 'com.mercadopago.wallet';
+/** Si es true, "Transferiste $ X a Juan" también se carga como gasto (por defecto se ignora). */
+const MP_NOTIF_INCLUIR_TRANSFERENCIAS = false;
+/** Ventana para descartar la misma notificación repetida (mismo importe y comercio). */
+const MP_NOTIF_VENTANA_SEG = 180;
+/** Si es false, no se recalcula el Tablero en cada notificación (responde más rápido). */
+const MP_NOTIF_ACTUALIZAR_TABLERO = true;
+const MP_NOTIF_PROP_TOKEN = 'MP_WEBHOOK_TOKEN';
+const MP_NOTIF_PROP_PENDIENTES = 'MP_NOTIF_PENDIENTES';
+
+/** Medios que aparecen en las notificaciones; se revisan antes que MP_MEDIOS. */
+const MP_MEDIOS_NOTIF = [
+  [/d[eé]bito[^,.]*mercado ?pago|mercado ?pago[^,.]*d[eé]bito|dinero (disponible|en cuenta)|\bsaldo\b|tu cuenta de mercado ?pago/i, 'Elio Mercado Pago'],
+  [/cr[eé]dito[^,.]*mercado ?pago|mercado ?pago[^,.]*cr[eé]dito|tarjeta mercado ?pago/i, 'Master Elio Mercado Pago']
+];
+
+/** No son gastos: cobros, transferencias recibidas, rechazos, devoluciones, códigos, promociones. */
+const MP_NOTIF_IGNORAR = /recibiste|te (transfiri|envi|pag|devolvi|deposit|acredit|reintegr)|cobraste|ingres(ó|aron|o) (dinero|plata|\$)|rendimiento|ganaste|reintegro|devoluci[oó]n|reembols|rechaz|no se pudo|no pudimos|no fue aprobad|cancel|c[oó]digo (de )?(seguridad|verificaci[oó]n|acceso)|tu c[oó]digo|inici(a|á|aste|o|ó) (de )?sesi[oó]n|\bpag[aá]\b|\bpagalo|\bpagal[ao]s\b|\bdevolv/i;
+const MP_NOTIF_TRANSFER = /transferiste|enviaste (dinero|plata|\$)/i;
+/** Señales de que la notificación es un pago hecho por vos. */
+const MP_NOTIF_PAGO = /pagaste|compraste|abonaste|recargaste|tu pago|tu compra|pago (con qr |con c[oó]digo qr )?aprobado|se aprob[oó] (tu|el) (pago|compra)|realizaste (un|el) pago|d[eé]bito autom[aá]tico/i;
+/** Importe: "$ 15.000", "$15.000,50", "US$ 22.18", "U$S 10". */
+const MP_NOTIF_IMPORTE = /(US\$|U\$S|U\$D|USD|ARS|\$)\s*(\d[\d.]*(?:,\d{1,2})?)/i;
+
+// ---------------- Web App ----------------
+
+function doPost(e) { return recibirNotificacionMP_(e, 'POST'); }
+function doGet(e) { return recibirNotificacionMP_(e, 'GET'); }
+
+/** Punto de entrada común. Nunca lanza errores: siempre responde JSON. */
+function recibirNotificacionMP_(e, metodo) {
+  let res;
+  try {
+    const p = paramsNotif_(e);
+    const guardado = PropertiesService.getScriptProperties().getProperty(MP_NOTIF_PROP_TOKEN) || '';
+    if (!guardado || !compararSeguro_(String(p.token || ''), guardado)) {
+      Logger.log('[Notificación MP] Rechazada por token inválido (' + metodo + ').');
+      return json_({ ok: false, error: 'token inválido' });
+    }
+    if (!p.titulo && !p.texto) return json_({ ok: true, accion: 'ping', mensaje: 'Conexión correcta con el ERP.' });
+    res = procesarNotificacionMP_(p, String(p.prueba || '') === '1');
+  } catch (err) {
+    Logger.log('[Notificación MP] Error inesperado: ' + (err && err.stack || err));
+    res = { ok: false, error: String(err && err.message || err) };
+  }
+  return json_(res);
+}
+
+/** Junta los parámetros de la URL, del formulario (x-www-form-urlencoded) o de un cuerpo JSON. */
+function paramsNotif_(e) {
+  const p = {};
+  if (e && e.parameter) Object.keys(e.parameter).forEach(function (k) { p[k] = e.parameter[k]; });
+  if (e && e.postData && e.postData.contents && /json/i.test(e.postData.type || '')) {
+    try {
+      const j = JSON.parse(e.postData.contents);
+      Object.keys(j).forEach(function (k) { if (p[k] === undefined) p[k] = j[k]; });
+    } catch (err) { Logger.log('[Notificación MP] El cuerpo no es JSON válido.'); }
+  }
+  ['token', 'titulo', 'texto', 'app', 'paquete', 'fecha', 'prueba'].forEach(function (k) {
+    p[k] = p[k] === undefined || p[k] === null ? '' : String(p[k]);
+    // Si MacroDroid no reemplazó la variable, llega literal: "{not_title}" o "[notification]"
+    if (/^[\[{][a-z_]+[\]}]$/i.test(p[k].trim())) p[k] = '';
+  });
+  return p;
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Compara sin cortar en el primer carácter distinto (no da pistas por tiempo de respuesta). */
+function compararSeguro_(a, b) {
+  a = String(a); b = String(b);
+  let dif = a.length ^ b.length;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) dif |= (a.charCodeAt(i % (a.length || 1)) || 0) ^ (b.charCodeAt(i % (b.length || 1)) || 0);
+  return dif === 0 && a.length > 0;
+}
+
+/**
+ * Interpreta y (si no es prueba) carga la notificación. Devuelve el resultado para la respuesta JSON.
+ * p: { titulo, texto, app, paquete, fecha }
+ */
+function procesarNotificacionMP_(p, soloPrueba) {
+  const resumenTxt = (p.titulo + ' | ' + p.texto).slice(0, 300);
+  if ((p.paquete && p.paquete !== MP_NOTIF_PAQUETE && !/mercado ?pago/i.test(p.paquete)) ||
+      (!p.paquete && p.app && !/mercado ?pago/i.test(p.app))) {
+    Logger.log('[Notificación MP] Ignorada: no es de Mercado Pago (' + (p.paquete || p.app) + ').');
+    return { ok: true, accion: 'ignorada', motivo: 'no es de Mercado Pago' };
+  }
+  let d;
+  try {
+    d = parsearNotificacionMP_(p.titulo, p.texto);
+  } catch (err) {
+    Logger.log('[Notificación MP][REVISAR] ' + err.message + ' → ' + resumenTxt);
+    if (!soloPrueba) registrarNotifNoLeida_(p, err.message);
+    return { ok: true, accion: 'revisar', motivo: err.message };
+  }
+  if (!d) {
+    Logger.log('[Notificación MP] Ignorada (no es un pago): ' + resumenTxt);
+    return { ok: true, accion: 'ignorada', motivo: 'no es un pago' };
+  }
+  const fecha = fechaNotif_(p.fecha);
+  if (soloPrueba) {
+    Logger.log('[Notificación MP][PRUEBA] ' + JSON.stringify(d));
+    return { ok: true, accion: 'prueba', datos: d };
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) return { ok: false, error: 'ocupado, reintentá' };
+  try {
+    const clave = claveNotif_(d);
+    const cache = CacheService.getScriptCache();
+    if (cache.get(clave)) {
+      Logger.log('[Notificación MP] Duplicada (misma en menos de ' + MP_NOTIF_VENTANA_SEG + ' s): ' + resumenTxt);
+      return { ok: true, accion: 'duplicada' };
+    }
+    verificarEstructura_();
+    const tz = libro_().getSpreadsheetTimeZone();
+    // Respaldo por si la caché se vació: misma clave en una nota de los últimos 3 minutos
+    const marca = Utilities.formatDate(new Date(), tz, 'yyyyMMddHHmm');
+    const notas = notasGastos_();
+    for (let i = 0; i <= Math.ceil(MP_NOTIF_VENTANA_SEG / 60); i++) {
+      const t = Utilities.formatDate(new Date(Date.now() - i * 60000), tz, 'yyyyMMddHHmm');
+      if (notas.indexOf(clave + '@' + t) !== -1) { cache.put(clave, '1', MP_NOTIF_VENTANA_SEG); return { ok: true, accion: 'duplicada' }; }
+    }
+    if (d.categoria && listaConfig_(2).indexOf(d.categoria) === -1) agregarCategoria_(d.categoria);
+    const sh = hoja_(H.GASTOS);
+    const fila = agregarFila_(H.GASTOS, {
+      'Fecha': fecha,
+      'Concepto': d.comercio,
+      'Categoría': d.categoria,
+      'Proveedor': d.comercio,
+      'Importe ARS': d.moneda === 'ARS' ? d.importe : '',
+      'Importe USD': d.moneda === 'USD' ? d.importe : '',
+      'Medio de pago': d.medio,
+      'Notas': MP_NOTA_NOTIF + ' · ' + (d.medioTexto || 'medio no informado') + ' · ' +
+        Utilities.formatDate(new Date(), tz, 'HH:mm') + ' · ' + clave + '@' + marca
+    });
+    const m = mapa_(sh);
+    if (m['Fecha']) sh.getRange(fila, m['Fecha']).setNumberFormat(FMT.FECHA);
+    if (m['Importe ARS']) sh.getRange(fila, m['Importe ARS']).setNumberFormat(FMT.ARS);
+    if (m['Importe USD']) sh.getRange(fila, m['Importe USD']).setNumberFormat(FMT.USD);
+    cache.put(clave, '1', MP_NOTIF_VENTANA_SEG);
+    procesarFilas_(sh, fila, fila); // asigna ID y pasa el gasto a Caja
+    try {
+      sincronizarCaja(true);
+      if (MP_NOTIF_ACTUALIZAR_TABLERO) actualizarTablero(true);
+    } catch (err) { Logger.log('[Notificación MP] Gasto cargado, pero falló Caja/Tablero: ' + err.message); }
+    Logger.log('[Notificación MP] Cargado en Gastos fila ' + fila + ': ' + d.comercio + ' ' + d.moneda + ' ' + d.importe + ' (' + d.medio + ')');
+    return { ok: true, accion: 'cargada', fila: fila, comercio: d.comercio, importe: d.importe, moneda: d.moneda, medio: d.medio, categoria: d.categoria };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Clave para detectar repetidas: moneda + importe + comercio normalizado. */
+function claveNotif_(d) {
+  const com = String(d.comercio).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
+  return 'MPN-' + d.moneda + Math.round(d.importe * 100) + '-' + com.slice(0, 30);
+}
+
+/** Fecha opcional: milisegundos ({not_timestamp}), "dd/mm/aaaa", "aaaa-mm-dd" o ISO. Si no hay, hoy. */
+function fechaNotif_(v) {
+  v = String(v || '').trim();
+  let d = null;
+  if (/^\d{12,14}$/.test(v)) d = new Date(+v);
+  else if (v) d = asFecha_(v.slice(0, 10)) || asFecha_(v) || (isNaN(new Date(v).getTime()) ? null : new Date(v));
+  if (!d || isNaN(d.getTime())) d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+// ---------------- Parser (sin servicios de Google: se prueba con node) ----------------
+
+/**
+ * Interpreta una notificación de Mercado Pago.
+ * Devuelve { comercio, importe, moneda, medio, medioTexto, categoria } si es un pago,
+ * null si no es un gasto (cobros, transferencias recibidas, promociones…),
+ * y lanza un error si parece un pago pero no se puede leer.
+ */
+function parsearNotificacionMP_(titulo, texto) {
+  const limpiar = function (s) { return String(s || '').replace(/[\u00a0\u202f]/g, ' ').replace(/\s+/g, ' ').trim(); };
+  titulo = limpiar(titulo); texto = limpiar(texto);
+  const todo = (titulo && texto && texto.indexOf(titulo) === -1 ? titulo + '. ' + texto : (texto || titulo));
+  if (!todo) return null;
+
+  const esTransfer = MP_NOTIF_TRANSFER.test(todo);
+  if (MP_NOTIF_IGNORAR.test(todo)) return null;
+  if (esTransfer && !MP_NOTIF_INCLUIR_TRANSFERENCIAS) return null;
+  const pareceAprobado = /aprob/i.test(todo);
+  const mi = todo.match(MP_NOTIF_IMPORTE);
+  if (!MP_NOTIF_PAGO.test(todo) && !esTransfer) return null;
+  if (!mi) {
+    if (pareceAprobado) throw new Error('parece un pago pero no trae el importe');
+    return null; // "¿Ya pagaste tus servicios?" y similares
+  }
+
+  const moneda = /U/i.test(mi[1]) ? 'USD' : 'ARS';
+  const importe = importeAR_(mi[2]);
+  if (!importe) throw new Error('importe inválido: ' + mi[2]);
+
+  // Comercio: se prueba en el texto y después en el título
+  const IMP = '(?:US\\$|U\\$S|U\\$D|USD|ARS|\\$)\\s*\\d[\\d.]*(?:,\\d{1,2})?';
+  const FIN = '(?=\\s+con\\s|\\s+en\\s+\\d+\\s+cuotas?|\\s+por\\s+' + IMP + '|\\s+(?:fue|se|ha sido|est[aá])\\s+aprob|,\\s*' + IMP + '|\\s*[!¡?|]|\\.\\s*$|\\.\\s+[A-ZÁÉÍÓÚÑ¿¡]|\\s+-\\s|$)';
+  const patrones = [
+    new RegExp('(?:le\\s+)?pagaste\\s+a\\s+(.+?),?\\s*' + IMP, 'i'),                         // Pagaste a MCD- Kaosanroad 2, US$ 22.18
+    new RegExp('(?:pagaste|abonaste|transferiste|enviaste)\\s+' + IMP + '\\s+(?:con\\s+(?:c[oó]digo\\s+)?qr\\s+)?(?:a|en)\\s+(.+?)' + FIN, 'i'), // Pagaste $ 15.000 a YPF
+    new RegExp('(?:tu\\s+)?(?:pago|compra)\\s+(?:con\\s+(?:c[oó]digo\\s+)?qr\\s+)?de\\s+' + IMP + '\\s+(?:a|en)\\s+(.+?)' + FIN, 'i'), // Tu pago de $ 1.234 a X fue aprobado
+    new RegExp('compraste\\s+en\\s+(.+?)\\s+por\\s+' + IMP, 'i'),                           // Compraste en X por $ …
+    new RegExp('(?:le\\s+)?(?:compraste|pagaste|abonaste)\\s+(?:a|en)\\s+(.+?)' + FIN, 'i'),  // Le compraste a X / Pagaste en X
+    new RegExp('pagaste\\s+(?:tu\\s+|la\\s+|el\\s+)?(?:factura|servicio|boleta|cuota|impuesto)\\s+(?:de\\s+)?(.+?)\\s+(?:por|de)\\s+' + IMP, 'i'), // Pagaste tu factura de Edemsa por $ X
+    new RegExp('recargaste\\s+' + IMP + '\\s+(?:a|en)\\s+(?:tu\\s+)?(.+?)' + FIN, 'i'),       // Recargaste $ 2.000 a tu SUBE
+    new RegExp('pago\\s+(?:con\\s+(?:c[oó]digo\\s+)?qr\\s+)?aprobado\\s+(?:en|a)\\s+(.+?)' + FIN, 'i'), // Pago aprobado en X
+    new RegExp('(?:pagaste|abonaste)\\s+' + IMP + '\\s+(?:a|en)\\s+(.+)$', 'i')
+  ];
+  let comercio = '';
+  const fuentes = [texto, titulo, todo, (titulo + ' ' + texto).trim()]; // el último: título "Pagaste $ X" + texto "a COMERCIO…"
+  for (let f = 0; f < fuentes.length && !comercio; f++) {
+    if (!fuentes[f]) continue;
+    for (let i = 0; i < patrones.length; i++) {
+      const mc = fuentes[f].match(patrones[i]);
+      if (mc && mc[1] && limpiarComercio_(mc[1])) { comercio = limpiarComercio_(mc[1]); break; }
+    }
+  }
+  if (!comercio) throw new Error('no encontré el comercio');
+
+  // Medio: "con tu Tarjeta de Crédito Mercado Pago", "con dinero disponible", "Mastercard **** 1234"…
+  let medioTexto = '';
+  const mm = todo.match(/\bcon\s+(?:tu|tus|el|la|su)?\s*((?:tarjeta|dinero|saldo|master ?card|visa|amex|american|cabal|naranja|d[eé]bito|cr[eé]dito|cuotas sin tarjeta|mercado ?cr[eé]dito|qr)[^.,!|]*)/i) ||
+    todo.match(/((?:tarjeta|master ?card|visa)\s[^.,!|]*|dinero disponible|dinero en cuenta)/i);
+  if (mm) medioTexto = limpiar(mm[1]).replace(/\s+(en\s+\d+\s+cuotas?.*)$/i, '');
+  if (/^qr\b/i.test(medioTexto)) medioTexto = '';
+  let medio = '';
+  if (medioTexto) {
+    const reglas = MP_MEDIOS_NOTIF.concat(MP_MEDIOS);
+    for (let i = 0; i < reglas.length; i++) {
+      if (reglas[i][0].test(medioTexto)) { medio = reglas[i][1]; break; }
+    }
+    // "con tu tarjeta de crédito" sin banco: es tu Mastercard de Mercado Pago (medio por defecto)
+    if (!medio && /^(tarjeta( de)? cr[eé]dito|cr[eé]dito)\s*$/i.test(medioTexto)) medio = medioNotifDefecto_();
+    if (!medio) medio = medioTexto;
+  }
+  if (!medio && esTransfer) medio = 'Elio Mercado Pago';
+  if (!medio) medio = medioNotifDefecto_();
+
+  let categoria = '';
+  for (let i = 0; i < MP_CATEGORIAS.length; i++) {
+    if (MP_CATEGORIAS[i][0].test(comercio + ' ' + todo)) { categoria = MP_CATEGORIAS[i][1]; break; }
+  }
+  return { comercio: comercio, importe: importe, moneda: moneda, medio: medio, medioTexto: medioTexto, categoria: categoria };
+}
+
+function limpiarComercio_(s) {
+  return String(s || '')
+    .replace(/^\s*(?:el comercio|la tienda|el local)\s+/i, '')
+    .replace(/^(?:MERPAGO|MERCADOPAGO|MP)\s*\*\s*/i, '')
+    .replace(/\s+con\s+(?:tu|tus|el|la)\s.*$/i, '')
+    .replace(/["“”]/g, '')
+    .replace(/[\s.,;:\-–]+$/, '')
+    .replace(/^[\s.,;:\-–]+/, '')
+    .trim()
+    .slice(0, 80);
+}
+
+/** "15.000" → 15000 · "15.000,50" → 15000.5 · "22.18" → 22.18 · "1.234.567" → 1234567. */
+function importeAR_(s) {
+  s = String(s || '').replace(/\s/g, '').replace(/\.+$/, '');
+  if (!s) return 0;
+  if (s.indexOf(',') !== -1) s = s.replace(/\./g, '').replace(',', '.');
+  else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : Math.round(n * 100) / 100;
+}
+
+function medioNotifDefecto_() {
+  try {
+    const v = PropertiesService.getScriptProperties().getProperty('MP_MEDIO_NOTIF_DEFECTO');
+    if (v) return v;
+  } catch (e) {}
+  return MP_MEDIO_NOTIF_DEFECTO;
+}
+
+// ---------------- Notificaciones que no se pudieron leer ----------------
+
+/** Guarda la notificación para revisarla (propiedad del script + fila en Problemas). Nunca lanza errores. */
+function registrarNotifNoLeida_(p, motivo) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    let lista = [];
+    try { lista = JSON.parse(props.getProperty(MP_NOTIF_PROP_PENDIENTES) || '[]'); } catch (e) {}
+    const item = { cuando: new Date().toISOString(), titulo: String(p.titulo).slice(0, 120), texto: String(p.texto).slice(0, 300), motivo: motivo };
+    lista.push(item);
+    props.setProperty(MP_NOTIF_PROP_PENDIENTES, JSON.stringify(lista.slice(-25)));
+    const sh = libro_().getSheetByName(H.PROB);
+    if (sh) sh.appendRow(filaProblemaNotif_(item));
+  } catch (e) {
+    Logger.log('[Notificación MP][REVISAR] No se pudo guardar para revisión: ' + e.message);
+  }
+}
+
+function filaProblemaNotif_(item) {
+  return ['Notificaciones MP', '', '', item.titulo || '(sin título)',
+    'Notificación de Mercado Pago sin leer (' + item.motivo + '): "' + item.texto + '". Cargala con Nuevo gasto y después ejecutá limpiarNotificacionesNoLeidasMP.', 'Media', ''];
+}
+
+/** Para revisarDatosIncompletos: las notificaciones sin leer siguen apareciendo en Problemas hasta que las limpies. */
+function problemasNotifMP_() {
+  try {
+    return JSON.parse(PropertiesService.getScriptProperties().getProperty(MP_NOTIF_PROP_PENDIENTES) || '[]')
+      .map(function (it) { return filaProblemaNotif_(it).slice(0, 6); });
+  } catch (e) { return []; }
+}
+
+function verNotificacionesNoLeidasMP() {
+  const filas = problemasNotifMP_();
+  if (!filas.length) { Logger.log('No hay notificaciones de Mercado Pago sin leer.'); return; }
+  filas.forEach(function (f, i) { Logger.log((i + 1) + ') ' + f[3] + ' → ' + f[4]); });
+}
+
+function limpiarNotificacionesNoLeidasMP() {
+  PropertiesService.getScriptProperties().deleteProperty(MP_NOTIF_PROP_PENDIENTES);
+  Logger.log('Listo: se borró la lista de notificaciones sin leer. Volvé a ejecutar revisarDatosIncompletos para limpiar Problemas.');
+  toast_('Lista de notificaciones sin leer borrada.', 'Mercado Pago', 5);
+}
+
+// ---------------- Configuración y prueba ----------------
+
+/** Crea el token (si falta) y escribe en el registro los pasos exactos para publicar y configurar MacroDroid. */
+function configurarNotificacionesMP() {
+  const props = PropertiesService.getScriptProperties();
+  let token = props.getProperty(MP_NOTIF_PROP_TOKEN);
+  if (!token) {
+    token = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '').slice(0, 8);
+    props.setProperty(MP_NOTIF_PROP_TOKEN, token);
+    Logger.log('Se creó un token nuevo.');
+  }
+  try { libro_(); } catch (e) { Logger.log('OJO: ' + e.message); }
+  let url = '';
+  try { url = ScriptApp.getService().getUrl() || ''; } catch (e) {}
+  const urlTxt = url && /\/exec$/.test(url) ? url : 'LA_URL_DE_TU_APLICACION_WEB (termina en /exec)';
+  const L = [
+    '================ NOTIFICACIONES DE MERCADO PAGO ================',
+    'Token secreto (no lo compartas): ' + token,
+    '',
+    '1) PUBLICAR (una sola vez): Implementar > Nueva implementación > engranaje "Seleccionar tipo" > Aplicación web.',
+    '   Descripción: ERP notificaciones · Ejecutar como: Yo · Quién tiene acceso: Cualquier usuario > Implementar.',
+    '   Autorizá los permisos y copiá la "URL de la aplicación web" (termina en /exec).',
+    '   Si después cambiás el código: Implementar > Gestionar implementaciones > lápiz > Versión: Nueva versión > Implementar (la URL no cambia).',
+    '',
+    '2) MACRODROID > Agregar macro:',
+    '   Disparador: Eventos del dispositivo > Notificación > Notificación recibida > Seleccionar aplicaciones: Mercado Pago (' + MP_NOTIF_PAQUETE + ')',
+    '      > Texto: Cualquiera (el script descarta lo que no sea un pago). Tildá "Ignorar notificaciones persistentes".',
+    '   Acción: Interacciones web (en algunas versiones Conectividad) > Solicitud HTTP:',
+    '      Método: POST · URL: ' + urlTxt,
+    '      Parámetros de consulta (Query params), clave = valor (las variables se eligen con el botón "…"):',
+    '         token = ' + token,
+    '         titulo = {not_title}',
+    '         texto = {notification}',
+    '         app = {not_app_name}',
+    '         paquete = {not_app_package}',
+    '         fecha = {not_timestamp}',
+    '      Si existe "Seguir redirecciones (Follow redirects)", dejala activada (Apps Script responde con un 302).',
+    '   Si el POST falla: cambiá el Método a GET con los mismos parámetros. El script acepta las dos formas.',
+    '   Android: MacroDroid con Acceso a notificaciones y Batería "Sin restricciones".',
+    '',
+    '3) PROBAR sin cargar nada: abrí en el navegador',
+    '   ' + urlTxt + '?token=' + token + '&prueba=1&titulo=Mercado%20Pago&texto=Pagaste%20%24%2025.000%20en%20YPF',
+    '   Tiene que responder {"ok":true,"accion":"prueba",...}. Sin "&prueba=1" la carga de verdad en Gastos.',
+    '================================================================'
+  ];
+  L.forEach(function (l) { Logger.log(l); });
+  if (VINCULADO_) {
+    try { const ui = ui_(); ui.alert('Notificaciones de Mercado Pago', 'Listo. Abrí Extensiones > Apps Script > Ejecuciones para ver los pasos y el token, o ejecutá configurarNotificacionesMP desde el editor.', ui.ButtonSet.OK); } catch (e) {}
+  }
+  return token;
+}
+
+/** Muestra el token actual en el registro (para volver a copiarlo en MacroDroid). */
+function verNotificacionesMP_token() {
+  const t = PropertiesService.getScriptProperties().getProperty(MP_NOTIF_PROP_TOKEN);
+  Logger.log(t ? 'Token actual: ' + t : 'Todavía no hay token. Ejecutá configurarNotificacionesMP.');
+  return t;
+}
+
+/** Cambia el token (por ejemplo si se filtró). Después hay que actualizarlo en MacroDroid. */
+function regenerarTokenMP() {
+  PropertiesService.getScriptProperties().deleteProperty(MP_NOTIF_PROP_TOKEN);
+  Logger.log('Token anterior anulado: MacroDroid deja de funcionar hasta que pegues el nuevo.');
+  return configurarNotificacionesMP();
+}
+
+/** Prueba en seco: interpreta notificaciones de ejemplo y muestra el resultado SIN escribir nada en la planilla. */
+function probarNotificacionMP() {
+  const ejemplos = [
+    ['Mercado Pago', 'Pagaste $ 25.000 en YPF'],
+    ['Pago con QR aprobado', 'Pagaste $ 18.450,50 a ESTACION GNC SUR con tu Tarjeta de Crédito Mercado Pago.'],
+    ['Recibiste dinero', 'Te transfirieron $ 10.000']
+  ];
+  ejemplos.forEach(function (ej) {
+    let r;
+    try { r = parsearNotificacionMP_(ej[0], ej[1]); r = r ? JSON.stringify(r) : 'ignorada (no es un pago)'; }
+    catch (e) { r = 'REVISAR: ' + e.message; }
+    Logger.log('[PRUEBA] "' + ej[0] + ' | ' + ej[1] + '" → ' + r);
+  });
+  Logger.log('Prueba en seco: no se escribió nada en la planilla.');
 }
 
 // ----------------------------------------------------------------------------

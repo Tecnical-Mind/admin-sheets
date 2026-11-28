@@ -8,14 +8,14 @@ Script de Google Apps Script que convierte una planilla de Google Sheets en un s
 
 1. Abrí la planilla.
 2. Andá a **Extensiones > Apps Script**.
-3. Pegá el contenido de `Codigo.gs`.
+3. Pegá el contenido de `Codigo_v1.8.gs`. En el editor de Apps Script el archivo se llama `Código.gs`; cualquier nombre sirve.
 4. Guardá.
 5. Recargá la planilla.
 6. Usá el menú **Administración**.
 
 ### B) Script independiente
 
-1. En `Codigo.gs`, completá la constante `ID_PLANILLA` con el ID de la planilla: la parte de la URL que está entre `/d/` y `/edit`, sin la barra final.
+1. En `Codigo_v1.8.gs`, completá la constante `ID_PLANILLA` con el ID de la planilla: la parte de la URL que está entre `/d/` y `/edit`, sin la barra final.
 2. Ejecutá `vincularPlanilla`.
 3. Ejecutá `crearEstructura` con **Ejecutar** (no con **Depurar**).
 
